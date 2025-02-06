@@ -29,14 +29,8 @@ let botReady = false;
 const startWhatsAppClient = () => {
     if (client || botReady) return;
 
-    //client = new Client({ puppeteer: { headless: true } });
-//solo Render.com
-    client = new Client({
-    puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
-});
+    client = new Client({ puppeteer: { headless: true } });
+
     
     client.on('qr', (qr) => {
         if (botReady) return;
