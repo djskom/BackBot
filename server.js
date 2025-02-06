@@ -7,8 +7,8 @@ const axios = require('axios');
 const cors = require('cors');
 
 const app = express();
-const server = http.createServer(app);  // Crear servidor HTTP
-const io = new Server(server, {        // Adjuntar socket.io al servidor HTTP
+const server = http.createServer(app);  
+const io = new Server(server, {        
     cors: {
         origin: "https://asistentewhats.netlify.app",
         methods: ["GET", "POST"],
@@ -29,8 +29,15 @@ let botReady = false;
 const startWhatsAppClient = () => {
     if (client || botReady) return;
 
-    client = new Client({ puppeteer: { headless: true } });
-
+    //client = new Client({ puppeteer: { headless: true } });
+//solo Render.com
+    client = new Client({
+    puppeteer: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    }
+});
+    
     client.on('qr', (qr) => {
         if (botReady) return;
         console.log('📡 Generando QR...');
