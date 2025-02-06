@@ -34,11 +34,10 @@ const startWhatsAppClient = async () => {
 
     // Create the socket with auth state
     sock = makeWASocket({
-        printQRInTerminal: true,
-        auth: state,
-        // Add browser description for better connection stability
-        browser: ['Asistente WhatsApp', 'Chrome', '1.0.0']
-    });
+    printQRInTerminal: false,
+    browser: ["Chrome", "Safari", "1.0"] 
+});
+
 
     // Listen for credentials updates
     sock.ev.on('creds.update', saveCreds);
