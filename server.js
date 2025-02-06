@@ -1,8 +1,8 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
+const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
+const qrcode = require('qr-image');
 const axios = require('axios');
 const cors = require('cors');
 const { Boom } = require('@hapi/boom');
@@ -28,27 +28,18 @@ let botReady = false;
 const startWhatsAppClient = async () => {
     if (sock || botReady) return;
 
-    // Configuración del estado de autenticación en memoria
-    const { state, saveCreds } = await useSingleFileAuthState();
-
     sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false
+        printQRInTerminal: true
     });
-
-    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            qrcode.toDataURL(qr, (err, url) => {
-                if (err) {
-                    console.error('Error generando QR:', err);
-                } else {
-                    io.emit('qrCode', url);
-                }
-            });
+            // Generar el código QR en formato PNG utilizando qr-image
+            const qr_png = qrcode.imageSync(qr, { type: 'png' });
+            const qrDataUrl = `data:image/png;base64,${qr_png.toString('base64')}`;
+            io.emit('qrCode', qrDataUrl);
         }
 
         if (connection === 'close') {
