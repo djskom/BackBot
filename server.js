@@ -1,11 +1,12 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const qrcode = require('qr-image');
 const axios = require('axios');
 const cors = require('cors');
 const { Boom } = require('@hapi/boom');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -28,28 +29,41 @@ let botReady = false;
 const startWhatsAppClient = async () => {
     if (sock || botReady) return;
 
+    // Initialize the auth state
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+
+    // Create the socket with auth state
     sock = makeWASocket({
-        printQRInTerminal: true
+        printQRInTerminal: true,
+        auth: state,
+        // Add browser description for better connection stability
+        browser: ['Asistente WhatsApp', 'Chrome', '1.0.0']
     });
+
+    // Listen for credentials updates
+    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-
+        
         if (qr) {
-            // Generar el código QR en formato PNG utilizando qr-image
             const qr_png = qrcode.imageSync(qr, { type: 'png' });
             const qrDataUrl = `data:image/png;base64,${qr_png.toString('base64')}`;
             io.emit('qrCode', qrDataUrl);
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error instanceof Boom) && lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
+            const shouldReconnect = lastDisconnect?.error instanceof Boom && 
+                lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
             console.log('❌ Conexión cerrada, reconectando...', shouldReconnect);
+            
             if (shouldReconnect) {
                 startWhatsAppClient();
             } else {
                 sock = null;
                 botReady = false;
+                // Clear auth state if logged out
+                require('fs').rmSync('auth_info_baileys', { recursive: true, force: true });
             }
         } else if (connection === 'open') {
             console.log('✅ WhatsApp Bot conectado!');
@@ -64,7 +78,8 @@ const startWhatsAppClient = async () => {
 
         const messageType = Object.keys(message.message)[0];
         const userId = message.key.remoteJid;
-        const userMessage = message.message.conversation || message.message.extendedTextMessage?.text || '';
+        const userMessage = message.message.conversation || 
+                          message.message.extendedTextMessage?.text || '';
 
         if (userId.includes('@g.us')) return;
 
@@ -79,8 +94,15 @@ const startWhatsAppClient = async () => {
             return;
         }
 
-        const response = await generateExternalLLMResponse(userId, userMessage);
-        await sock.sendMessage(userId, { text: response });
+        try {
+            const response = await generateExternalLLMResponse(userId, userMessage);
+            await sock.sendMessage(userId, { text: response });
+        } catch (error) {
+            console.error('Error sending message:', error);
+            await sock.sendMessage(userId, { 
+                text: 'Lo siento, ocurrió un error al procesar tu mensaje.' 
+            });
+        }
     });
 };
 
