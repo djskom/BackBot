@@ -1,11 +1,13 @@
 const makeWASocket = require("@whiskeysockets/baileys").default;
-const { DisconnectReason } = require("@whiskeysockets/baileys");
+const { DisconnectReason, useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const qrcode = require("qr-image");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const axios = require("axios"); // Added missing axios import
+const axios = require("axios");
+const path = require("path");
+const fs = require('fs').promises;
 
 const app = express();
 const server = http.createServer(app);
@@ -21,53 +23,77 @@ const io = new Server(server, {
 let sock = null;
 let lastQr = null;
 
+// Crear directorio temporal para auth si no existe
+const AUTH_DIR = path.join('/tmp', 'whatsapp_auth');
+
 // Función para iniciar el cliente WhatsApp
-const startWhatsAppClient = () => {
+const startWhatsAppClient = async () => {
     if (sock) return;  // Evita múltiples instancias
     
-    sock = makeWASocket({
-        printQRInTerminal: false,  // No imprime QR en consola
-        browser: ["Chrome", "Safari", "1.0"], // Simula WhatsApp Web
-        auth: undefined  // No almacena credenciales
-    });
-
-    // Evento para generar el código QR
-    sock.ev.on("connection.update", (update) => {
-        const { qr, connection, lastDisconnect } = update;
+    try {
+        // Asegurar que el directorio temporal existe
+        await fs.mkdir(AUTH_DIR, { recursive: true });
         
-        if (qr) {
-            console.log("📡 Generando QR...");
-            lastQr = `data:image/png;base64,${qrcode.imageSync(qr, { type: "png" }).toString("base64")}`;
-            io.emit("qrCode", lastQr);
-        }
-
-        if (connection === "close") {
-            const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            console.log("❌ Conexión cerrada, motivo:", reason);
-            sock = null;
-            setTimeout(startWhatsAppClient, 5000); // Reintentar tras 5 segundos
-        } else if (connection === "open") {
-            console.log("✅ WhatsApp conectado!");
-            io.emit("botReady", true);
-        }
-    });
-
-    // Evento para recibir mensajes
-    sock.ev.on("messages.upsert", async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.fromMe) return;
+        // Configurar el estado de autenticación en directorio temporal
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
         
-        const userMessage = msg.message.conversation || msg.message?.extendedTextMessage?.text || ""; // Added support for quoted messages
-        const userId = msg.key.remoteJid;
-        
-        if (userMessage.toLowerCase() === "hola") {
-            await sock.sendMessage(userId, { text: "👋 ¡Hola! Soy el asistente de WhatsApp." });
-            return;
-        }
+        sock = makeWASocket({
+            printQRInTerminal: false,
+            browser: ["Chrome", "Safari", "1.0"],
+            auth: state
+        });
 
-        const response = await generateExternalLLMResponse(userId, userMessage);
-        await sock.sendMessage(userId, { text: response });
-    });
+        // Evento para guardar credenciales
+        sock.ev.on("creds.update", saveCreds);
+
+        // Evento para generar el código QR
+        sock.ev.on("connection.update", (update) => {
+            const { qr, connection, lastDisconnect } = update;
+            
+            if (qr) {
+                console.log("📡 Generando QR...");
+                lastQr = `data:image/png;base64,${qrcode.imageSync(qr, { type: "png" }).toString("base64")}`;
+                io.emit("qrCode", lastQr);
+            }
+
+            if (connection === "close") {
+                const shouldReconnect = (lastDisconnect?.error instanceof Boom)
+                    ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
+                    : true;
+                console.log("❌ Conexión cerrada debido a:", lastDisconnect?.error?.output?.payload?.message);
+                
+                if (shouldReconnect) {
+                    sock = null;
+                    setTimeout(startWhatsAppClient, 5000);
+                }
+            } else if (connection === "open") {
+                console.log("✅ WhatsApp conectado!");
+                io.emit("botReady", true);
+            }
+        });
+
+        // Evento para recibir mensajes
+        sock.ev.on("messages.upsert", async (m) => {
+            const msg = m.messages[0];
+            if (!msg.message || msg.key.fromMe) return;
+            
+            const userMessage = msg.message.conversation || msg.message?.extendedTextMessage?.text || "";
+            const userId = msg.key.remoteJid;
+            
+            if (userMessage.toLowerCase() === "hola") {
+                await sock.sendMessage(userId, { text: "👋 ¡Hola! Soy el asistente de WhatsApp." });
+                return;
+            }
+
+            const response = await generateExternalLLMResponse(userId, userMessage);
+            await sock.sendMessage(userId, { text: response });
+        });
+
+    } catch (error) {
+        console.error("Error al iniciar el cliente de WhatsApp:", error);
+        // Reintentar en caso de error
+        setTimeout(startWhatsAppClient, 5000);
+    }
 };
 
 // Función para llamar al LLM
@@ -92,9 +118,19 @@ io.on("connection", (socket) => {
     }
 });
 
+// Limpiar directorio temporal al iniciar
+process.on('SIGTERM', async () => {
+    try {
+        await fs.rm(AUTH_DIR, { recursive: true, force: true });
+    } catch (error) {
+        console.error('Error al limpiar directorio temporal:', error);
+    }
+    process.exit(0);
+});
+
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server en ejecución en http://localhost:${PORT}`);
-    startWhatsAppClient();
+    startWhatsAppClient().catch(console.error);
 });
