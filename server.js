@@ -1,13 +1,11 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const qrcode = require('qr-image');
+const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode');
 const axios = require('axios');
 const cors = require('cors');
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const { DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-
 
 const app = express();
 const server = http.createServer(app);
@@ -23,26 +21,34 @@ app.use(cors({
     origin: "https://asistentewhats.netlify.app",
     credentials: true
 }));
+
 let sock = null;
-let lastQr = null;
 let botReady = false;
 
-
-const startWhatsAppClient = () => {
+const startWhatsAppClient = async () => {
     if (sock || botReady) return;
 
+    // Configuración del estado de autenticación en memoria
+    const { state, saveCreds } = await useSingleFileAuthState();
+
     sock = makeWASocket({
+        auth: state,
         printQRInTerminal: false
     });
+
+    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('📡 Generando QR...');
-            const qr_png = qrcode.imageSync(qr, { type: 'png' });
-            lastQr = `data:image/png;base64,${qr_png.toString('base64')}`;
-            io.emit('qrCode', lastQr);
+            qrcode.toDataURL(qr, (err, url) => {
+                if (err) {
+                    console.error('Error generando QR:', err);
+                } else {
+                    io.emit('qrCode', url);
+                }
+            });
         }
 
         if (connection === 'close') {
@@ -61,27 +67,29 @@ const startWhatsAppClient = () => {
         }
     });
 
-    sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.key.fromMe && msg.message) {
-            const messageType = Object.keys(msg.message)[0];
-            const userId = msg.key.remoteJid;
-            const userMessage = msg.message.conversation || msg.message[messageType].caption || '';
+    sock.ev.on('messages.upsert', async (msg) => {
+        const message = msg.messages[0];
+        if (!message.message || message.key.fromMe) return;
 
-            if (userMessage.toLowerCase() === 'hola') {
-                await sock.sendMessage(userId, { text: '👋 ¡Hola! Soy el asistente de WhatsApp.' });
-                return;
-            }
+        const messageType = Object.keys(message.message)[0];
+        const userId = message.key.remoteJid;
+        const userMessage = message.message.conversation || message.message.extendedTextMessage?.text || '';
 
-            if (['audioMessage', 'documentMessage', 'imageMessage', 'videoMessage'].includes(messageType)) {
-                const warningMessage = "Por favor, no envíes audios ni archivos multimedia. Solo puedo responder a mensajes de texto.";
-                await sock.sendMessage(userId, { text: warningMessage });
-                return;
-            }
+        if (userId.includes('@g.us')) return;
 
-            const response = await generateExternalLLMResponse(userId, userMessage);
-            await sock.sendMessage(userId, { text: response });
+        if (['audioMessage', 'documentMessage', 'imageMessage', 'videoMessage'].includes(messageType)) {
+            const warningMessage = "Por favor, no envíes audios ni archivos multimedia. Solo puedo responder a mensajes de texto.";
+            await sock.sendMessage(userId, { text: warningMessage });
+            return;
         }
+
+        if (userMessage.trim().toLowerCase() === 'hola') {
+            await sock.sendMessage(userId, { text: '👋 ¡Hola! Soy el asistente de WhatsApp.' });
+            return;
+        }
+
+        const response = await generateExternalLLMResponse(userId, userMessage);
+        await sock.sendMessage(userId, { text: response });
     });
 };
 
@@ -97,22 +105,8 @@ async function generateExternalLLMResponse(userId, message) {
 
 io.on('connection', (socket) => {
     console.log('📡 Cliente conectado');
-
     socket.on("startQR", () => {
         if (!botReady) startWhatsAppClient();
-    });
-
-    if (lastQr && !botReady) {
-        socket.emit('qrCode', lastQr);
-    }
-
-    const keepAliveInterval = setInterval(() => {
-        socket.emit('ping', { message: 'Manteniendo conexión WebSocket' });
-    }, 25000);
-
-    socket.on('disconnect', () => {
-        console.log('❌ Cliente desconectado');
-        clearInterval(keepAliveInterval);
     });
 });
 
@@ -120,4 +114,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server en ejecución en http://localhost:${PORT}`);
 });
-
