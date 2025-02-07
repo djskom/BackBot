@@ -1,17 +1,14 @@
-const makeWASocket = require("@whiskeysockets/baileys").default;
-const { DisconnectReason, useMultiFileAuthState } = require("@whiskeysockets/baileys");
-const { Boom } = require("@hapi/boom");
-const qrcode = require("qr-image");
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const axios = require("axios");
-const path = require("path");
-const fs = require('fs').promises;
+const express = require('express');
+const http = require('http');  // Importar http
+const { Server } = require('socket.io');
+const { Client } = require('whatsapp-web.js');
+const qrcode = require('qr-image');
+const axios = require('axios');
+const cors = require('cors');
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
+const server = http.createServer(app);  
+const io = new Server(server, {        
     cors: {
         origin: "https://asistentewhats.netlify.app",
         methods: ["GET", "POST"],
@@ -19,84 +16,71 @@ const io = new Server(server, {
     }
 });
 
+app.use(cors({
+    origin: "https://asistentewhats.netlify.app",
+    credentials: true
+}));
+
 // Variables de estado
-let sock = null;
+let client = null;
 let lastQr = null;
+let botReady = false;
 
-// Crear directorio temporal para auth si no existe
-const AUTH_DIR = path.join('/tmp', 'whatsapp_auth');
+const startWhatsAppClient = () => {
+    if (client || botReady) return;
 
-// Función para iniciar el cliente WhatsApp
-const startWhatsAppClient = async () => {
-    if (sock) return;  // Evita múltiples instancias
+    client = new Client({ puppeteer: { headless: true } });
+
     
-    try {
-        // Asegurar que el directorio temporal existe
-        await fs.mkdir(AUTH_DIR, { recursive: true });
+    client.on('qr', (qr) => {
+        if (botReady) return;
+        console.log('📡 Generando QR...');
+        const qr_png = qrcode.imageSync(qr, { type: 'png' });
+        lastQr = `data:image/png;base64,${qr_png.toString('base64')}`;
+        io.emit('qrCode', lastQr);
+    });
+
+    client.on('ready', () => {
+        console.log('✅ WhatsApp Bot conectado!');
+        botReady = true;
+        io.emit('botReady', true);
+    });
+
+    client.on('auth_failure', (msg) => {
+        console.error('❌ Error de autenticación:', msg);
+        io.emit('authError', 'Error de autenticación, por favor reinicia.');
+    });
+
+    client.on('message', async (message) => {
+        if (!botReady || !client.info) return;  // Verificar que el cliente está listo
+        const botNumber = client.info.wid.user; // Extraer el número del bot
+    
+        console.log(`🤖 Mensaje recibido en el bot (${botNumber}):`, message.body);
+    
+        if (message.from.includes('@g.us')) return; // Ignorar grupos
+    
+        if (['audio', 'document', 'image', 'video'].includes(message.type)) {
+            const warningMessage = "Por favor, no envíes audios ni archivos multimedia. Solo puedo responder a mensajes de texto.";
+            await message.reply(warningMessage);
+            return;
+        }
+    
+        const userId = message.from;
+        const userMessage = message.body.trim();
         
-        // Configurar el estado de autenticación en directorio temporal
-        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-        
-        sock = makeWASocket({
-            printQRInTerminal: false,
-            browser: ["Chrome", "Safari", "1.0"],
-            auth: state
-        });
+        if (userMessage.toLowerCase() === 'hola') {
+            return message.reply(`👋 ¡Hola! Soy el asistente de WhatsApp. Mi número es ${botNumber}.`);
+        }
+    
+        const response = await generateExternalLLMResponse(userId, userMessage);
+        message.reply(response);
+    });
+    
 
-        // Evento para guardar credenciales
-        sock.ev.on("creds.update", saveCreds);
-
-        // Evento para generar el código QR
-        sock.ev.on("connection.update", (update) => {
-            const { qr, connection, lastDisconnect } = update;
-            
-            if (qr) {
-                console.log("📡 Generando QR...");
-                lastQr = `data:image/png;base64,${qrcode.imageSync(qr, { type: "png" }).toString("base64")}`;
-                io.emit("qrCode", lastQr);
-            }
-
-            if (connection === "close") {
-                const shouldReconnect = (lastDisconnect?.error instanceof Boom)
-                    ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
-                    : true;
-                console.log("❌ Conexión cerrada debido a:", lastDisconnect?.error?.output?.payload?.message);
-                
-                if (shouldReconnect) {
-                    sock = null;
-                    setTimeout(startWhatsAppClient, 5000);
-                }
-            } else if (connection === "open") {
-                console.log("✅ WhatsApp conectado!");
-                io.emit("botReady", true);
-            }
-        });
-
-        // Evento para recibir mensajes
-        sock.ev.on("messages.upsert", async (m) => {
-            const msg = m.messages[0];
-            if (!msg.message || msg.key.fromMe) return;
-            
-            const userMessage = msg.message.conversation || msg.message?.extendedTextMessage?.text || "";
-            const userId = msg.key.remoteJid;
-            
-            if (userMessage.toLowerCase() === "hola") {
-                await sock.sendMessage(userId, { text: "👋 ¡Hola! Soy el asistente de WhatsApp." });
-                return;
-            }
-
-            const response = await generateExternalLLMResponse(userId, userMessage);
-            await sock.sendMessage(userId, { text: response });
-        });
-
-    } catch (error) {
-        console.error("Error al iniciar el cliente de WhatsApp:", error);
-        // Reintentar en caso de error
-        setTimeout(startWhatsAppClient, 5000);
-    }
+    client.initialize();
 };
 
-// Función para llamar al LLM
+// Función para generar respuestas con LLM
 async function generateExternalLLMResponse(userId, message) {
     try {
         const response = await axios.post(process.env.LLM_API_URL, { message });
@@ -107,30 +91,19 @@ async function generateExternalLLMResponse(userId, message) {
     }
 }
 
-// WebSockets para QR
-io.on("connection", (socket) => {
-    console.log("📡 Cliente conectado");
+// API para manejar WebSocket
+io.on('connection', (socket) => {
+    console.log('📡 Cliente conectado');
     socket.on("startQR", () => {
-        if (!sock) startWhatsAppClient();
+        if (!botReady) startWhatsAppClient();
     });
-    if (lastQr) {
-        socket.emit("qrCode", lastQr);
+    if (lastQr && !botReady) {
+        socket.emit('qrCode', lastQr);
     }
 });
 
-// Limpiar directorio temporal al iniciar
-process.on('SIGTERM', async () => {
-    try {
-        await fs.rm(AUTH_DIR, { recursive: true, force: true });
-    } catch (error) {
-        console.error('Error al limpiar directorio temporal:', error);
-    }
-    process.exit(0);
-});
-
-// Iniciar servidor
+// Iniciar el servidor
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, () => {  // Usar `server.listen` en lugar de `app.listen`
     console.log(`🚀 Server en ejecución en http://localhost:${PORT}`);
-    startWhatsAppClient().catch(console.error);
 });
