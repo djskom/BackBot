@@ -95,14 +95,16 @@ const startWhatsAppClient = () => {
 // Función para generar respuestas con LLM usando los nuevos parámetros
 async function generateExternalLLMResponse({ final_user, customer, sess_id, message }) {
     try {
-        const params = new URLSearchParams({
+        const response = await axios.post(process.env.LLM_API_URL, {
             final_user,
             customer,
             sess_id,
             message
+        }, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
         });
-
-        const response = await axios.get(`${process.env.LLM_API_URL}?${params}`);
         
         if (!response.data) {
             throw new Error('Respuesta vacía del servidor LLM');
@@ -111,6 +113,10 @@ async function generateExternalLLMResponse({ final_user, customer, sess_id, mess
         return response.data;
     } catch (error) {
         console.error("❌ Error con LLM API:", error.message);
+        if (error.response?.status === 405) {
+            console.error("Error: Método HTTP no permitido");
+            throw new Error("Error de configuración del API: Método no permitido");
+        }
         if (error.response?.data?.detail) {
             console.error("Validation Error:", error.response.data.detail);
         }
