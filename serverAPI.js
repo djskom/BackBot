@@ -95,12 +95,14 @@ const startWhatsAppClient = () => {
 // Función para generar respuestas con LLM usando los nuevos parámetros
 async function generateExternalLLMResponse({ final_user, customer, sess_id, message }) {
     try {
-        const response = await axios.post(process.env.LLM_API_URL, {
+        const params = new URLSearchParams({
             final_user,
             customer,
             sess_id,
             message
-        }, {
+        });
+
+        const response = await axios.post(`${process.env.LLM_API_URL}?${params}`, {}, {
             headers: {
                 'Content-Type': 'application/json'
             }
@@ -116,6 +118,10 @@ async function generateExternalLLMResponse({ final_user, customer, sess_id, mess
         if (error.response?.status === 405) {
             console.error("Error: Método HTTP no permitido");
             throw new Error("Error de configuración del API: Método no permitido");
+        }
+        if (error.response?.status === 422) {
+            console.error("Error de validación:", error.response.data);
+            throw new Error("Error de validación en los parámetros");
         }
         if (error.response?.data?.detail) {
             console.error("Validation Error:", error.response.data.detail);
@@ -146,3 +152,4 @@ const PORT = 3001;
 server.listen(PORT, () => {  
     console.log(`🚀 Server en ejecución en http://localhost:${PORT}`);
 });
+
