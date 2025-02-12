@@ -113,7 +113,8 @@ const startWhatsAppClient = (clientId, socket) => {
     });
 
     client.on('message', async (message) => {
-        if (!clientData.ready || !client.info) return;
+        const clientData = clients.get(clientId);
+        if (!clientData || !clientData.ready || !client.info) return;
         const botNumber = client.info.wid.user;
 
         console.log('\n=== NUEVO MENSAJE RECIBIDO ==='.cyan);
