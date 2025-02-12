@@ -1,3 +1,4 @@
+require('dotenv').config();  // Añadir al inicio del archivo
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -33,6 +34,24 @@ let client = null;
 let lastQr = null;
 let botReady = false;
 let sessionCounter = 0;
+const userSessions = new Map(); // Mapa para almacenar sesiones de usuarios
+
+// Función para limpiar sesiones
+function clearUserSessions() {
+    const sessionCount = userSessions.size;
+    userSessions.clear();
+    console.log(`\n=== LIMPIEZA DE SESIONES ===`.yellow);
+    console.log(`🧹 Se limpiaron ${sessionCount} sesiones`);
+    console.log(`⏰ Próxima limpieza en 24 horas`);
+    console.log(`==========================\n`.yellow);
+}
+
+// Configurar limpieza automática cada 24 horas
+const HOURS_24 = 24 * 60 * 60 * 1000; // 24 horas en milisegundos
+setInterval(clearUserSessions, HOURS_24);
+
+// Ejecutar primera limpieza al inicio
+console.log(`\n🔄 Programada limpieza automática de sesiones cada 24 horas\n`);
 
 const startWhatsAppClient = () => {
     if (client || botReady) return;
@@ -78,7 +97,7 @@ const startWhatsAppClient = () => {
         if (['audio', 'document', 'image', 'video'].includes(message.type)) {
             console.log('⚠️ Archivo multimedia detectado - enviando advertencia'.yellow);
             const warningMessage = "Por favor, no envíes audios ni archivos multimedia. Solo puedo responder a mensajes de texto.";
-            await message.reply(warningMessage);
+            await client.sendMessage(message.from, warningMessage);
             return;
         }
 
@@ -88,23 +107,28 @@ const startWhatsAppClient = () => {
         if (userMessage.toLowerCase() === 'hola') {
             sessionCounter++;
             console.log('👋 Mensaje de saludo detectado - respondiendo...'.green);
-            return message.reply(`👋 ¡Hola! Soy el asistente de WhatsApp. Mi número es ${botNumber}.`);
+            await client.sendMessage(message.from, `👋 ¡Hola! Soy el asistente de WhatsApp. Mi número es ${botNumber}.`);
+            return;
         }
 
         try {
+            // Obtener la sesión existente o usar null para nuevo usuario
+            const userSession = userSessions.get(userId);
+            const sess_id = userSession ? userSession.sess_id : null;
+
             console.log('\n=== ENVIANDO A LLM API ==='.cyan);
             console.log('🔄 Preparando request con:');
             console.log({
                 final_user: userId,
                 customer: botNumber,
-                sess_id: `session_${sessionCounter}`,
+                sess_id: sess_id,
                 message: userMessage
             });
 
             const response = await generateExternalLLMResponse({
                 final_user: userId,
                 customer: botNumber,
-                sess_id: `session_${sessionCounter}`,
+                sess_id: sess_id,
                 message: userMessage
             });
 
@@ -112,13 +136,13 @@ const startWhatsAppClient = () => {
             console.log('📨 Respuesta:', response);
             console.log('========================\n'.green);
 
-            await message.reply(response);
+            await client.sendMessage(message.from, response);
             console.log('✅ Mensaje enviado exitosamente'.green);
         } catch (error) {
             console.error('\n=== ERROR ==='.red);
             console.error('❌ Error al procesar mensaje:', error);
             console.error('==============\n'.red);
-            await message.reply("Lo siento, hubo un error al procesar tu mensaje.");
+            await client.sendMessage(message.from, "Lo siento, hubo un error al procesar tu mensaje.");
         }
     });
 
@@ -128,19 +152,30 @@ const startWhatsAppClient = () => {
 // Función para generar respuestas con LLM usando los nuevos parámetros
 async function generateExternalLLMResponse({ final_user, customer, sess_id, message }) {
     try {
+        if (!process.env.LLM_API_URL) {
+            console.error('\n=== ERROR DE CONFIGURACIÓN ==='.red);
+            console.error('❌ LLM_API_URL no está definida en las variables de entorno');
+            throw new Error('URL del API no configurada');
+        }
+
+        // Sanear los parámetros
         const params = new URLSearchParams({
-            final_user,
-            customer,
-            sess_id,
-            message
+            final_user: final_user.replace('@c.us', ''), // Remover @c.us del número
+            customer: customer,                          // Número del bot
+            sess_id: sess_id || null, // Permitir null en primer mensaje
+            message: message
         });
 
         console.log('\n=== LLAMADA A API ==='.cyan);
         console.log('🌐 URL:', process.env.LLM_API_URL);
         console.log('📎 Params:', params.toString());
 
-        const response = await axios.post(`${process.env.LLM_API_URL}?${params}`, {}, {
+        const apiUrl = new URL(process.env.LLM_API_URL);
+        console.log('🔍 URL completa:', `${apiUrl}?${params}`);
+
+        const response = await axios.post(`${apiUrl}?${params}`, '', {
             headers: {
+                'accept': 'application/json',
                 'Content-Type': 'application/json'
             }
         });
@@ -150,20 +185,35 @@ async function generateExternalLLMResponse({ final_user, customer, sess_id, mess
         console.log('📦 Data:', JSON.stringify(response.data, null, 2));
         console.log('===================\n'.cyan);
 
-        if (!response.data || !response.data.outputCustomer || !response.data.outputCustomer.message) {
+        // La respuesta ahora viene en el campo "risposta"
+        if (!response.data || !response.data.risposta) {
             console.error('⚠️ Estructura de respuesta incorrecta:', response.data);
             throw new Error('Formato de respuesta no válido');
         }
 
-        return response.data.outputCustomer.message;
+        // Guardar sess_id si viene en la respuesta
+        if (response.data.sess_id) {
+            const sess_server = `${final_user}_${response.data.sess_id}`;
+            userSessions.set(final_user, {
+                sess_id: response.data.sess_id,
+                sess_server: sess_server
+            });
+            console.log(`📝 Nueva sesión creada: ${sess_server}`);
+        }
+
+        return response.data.risposta;
     } catch (error) {
+        if (error.response?.status === 422) {
+            console.error('\n=== ERROR DE VALIDACIÓN ==='.red);
+            console.error('❌ Detalles:', JSON.stringify(error.response.data.detail, null, 2));
+        } else if (error.code === 'ERR_INVALID_URL') {
+            console.error('\n=== ERROR DE CONFIGURACIÓN ==='.red);
+            console.error('❌ La URL del API no es válida:', process.env.LLM_API_URL);
+        }
+        
         console.error('\n=== ERROR EN API ==='.red);
         console.error('❌ Tipo de error:', error.name);
         console.error('❌ Mensaje:', error.message);
-        if (error.response) {
-            console.error('❌ Status:', error.response.status);
-            console.error('❌ Data:', error.response.data);
-        }
         console.error('===================\n'.red);
         throw error;
     }
@@ -207,5 +257,3 @@ const PORT = 3001;
 server.listen(PORT, () => {  
     console.log(`🚀 Server en ejecución en http://localhost:${PORT}`);
 });
-
-
