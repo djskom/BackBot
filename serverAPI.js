@@ -11,7 +11,7 @@ const app = express();
 const server = http.createServer(app);  
 const io = new Server(server, {        
     cors: {
-        origin: "http://localhost:5173",
+        origin: true, // Allow all origins - you should restrict this in production
         methods: ["GET", "POST"],
         credentials: true
     },
@@ -23,63 +23,87 @@ const io = new Server(server, {
 
 // Configurar CORS con opciones extendidas
 app.use(cors({
-    origin: "http://localhost:5173",
+    origin: true, // Allow all origins - you should restrict this in production
     credentials: true,
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Variables de estado
-let client = null;
-let lastQr = null;
-let botReady = false;
-let sessionCounter = 0;
+let clients = new Map(); // Mapa para almacenar estados de clientes
 const userSessions = new Map(); // Mapa para almacenar sesiones de usuarios
 
-// Función para limpiar sesiones
-function clearUserSessions() {
+// Función para limpiar sesiones por cliente
+function clearUserSessions(clientId) {
     const sessionCount = userSessions.size;
-    userSessions.clear();
+    if (clientId) {
+        // Limpiar solo sesiones del cliente específico
+        for (const [key, session] of userSessions.entries()) {
+            if (session.clientId === clientId) {
+                userSessions.delete(key);
+            }
+        }
+    } else {
+        userSessions.clear();
+    }
     console.log(`\n=== LIMPIEZA DE SESIONES ===`.yellow);
     console.log(`🧹 Se limpiaron ${sessionCount} sesiones`);
-    console.log(`⏰ Próxima limpieza en 24 horas`);
     console.log(`==========================\n`.yellow);
 }
 
 // Configurar limpieza automática cada 24 horas
 const HOURS_24 = 24 * 60 * 60 * 1000; // 24 horas en milisegundos
-setInterval(clearUserSessions, HOURS_24);
+setInterval(() => {
+    for (const [clientId] of clients) {
+        clearUserSessions(clientId);
+    }
+}, HOURS_24);
 
 // Ejecutar primera limpieza al inicio
 console.log(`\n🔄 Programada limpieza automática de sesiones cada 24 horas\n`);
 
-const startWhatsAppClient = () => {
-    if (client || botReady) return;
+const startWhatsAppClient = (clientId, socket) => {
+    if (clients.has(clientId)) {
+        const clientData = clients.get(clientId);
+        if (clientData.ready) return;
+    }
 
-    client = new Client({ puppeteer: { headless: true } });
+    const client = new Client({ 
+        puppeteer: { 
+            headless: true,
+            args: ['--no-sandbox']
+        } 
+    });
+
+    clients.set(clientId, {
+        client,
+        ready: false,
+        qr: null
+    });
 
     client.on('qr', (qr) => {
-        if (botReady) return;
-        console.log('📡 Generando QR...');
-        // Enviamos el QR como texto directamente
-        lastQr = qr;
-        io.emit('qrCode', qr);
+        const clientData = clients.get(clientId);
+        if (clientData.ready) return;
+        
+        console.log(`📱 Generando QR para cliente ${clientId}...`);
+        clientData.qr = qr;
+        socket.emit('qrCode', qr);
     });
 
     client.on('ready', () => {
-        console.log('✅ WhatsApp Bot conectado!');
-        botReady = true;
-        io.emit('botReady', true);
-        sessionCounter = 0; // Reset session counter on new connection
+        const clientData = clients.get(clientId);
+        clientData.ready = true;
+        console.log(`✅ WhatsApp Bot conectado para cliente ${clientId}!`);
+        socket.emit('botReady', true);
     });
 
     client.on('auth_failure', (msg) => {
         console.error('❌ Error de autenticación:', msg);
-        io.emit('authError', 'Error de autenticación, por favor reinicia.');
+        socket.emit('authError', 'Error de autenticación, por favor reinicia.');
     });
 
     client.on('message', async (message) => {
-        if (!botReady || !client.info) return;
+        if (!clientData.ready || !client.info) return;
         const botNumber = client.info.wid.user;
 
         console.log('\n=== NUEVO MENSAJE RECIBIDO ==='.cyan);
@@ -126,6 +150,7 @@ const startWhatsAppClient = () => {
             });
 
             const response = await generateExternalLLMResponse({
+                clientId,
                 final_user: userId,
                 customer: botNumber,
                 sess_id: sess_id,
@@ -146,11 +171,14 @@ const startWhatsAppClient = () => {
         }
     });
 
-    client.initialize();
+    client.initialize().catch(err => {
+        console.error(`❌ Error inicializando cliente ${clientId}:`, err);
+        socket.emit('authError', 'Error iniciando WhatsApp');
+    });
 };
 
 // Función para generar respuestas con LLM usando los nuevos parámetros
-async function generateExternalLLMResponse({ final_user, customer, sess_id, message }) {
+async function generateExternalLLMResponse({ clientId, final_user, customer, sess_id, message }) {
     try {
         if (!process.env.LLM_API_URL) {
             console.error('\n=== ERROR DE CONFIGURACIÓN ==='.red);
@@ -193,8 +221,9 @@ async function generateExternalLLMResponse({ final_user, customer, sess_id, mess
 
         // Guardar sess_id si viene en la respuesta
         if (response.data.sess_id) {
-            const sess_server = `${final_user}_${response.data.sess_id}`;
+            const sess_server = `${clientId}_${final_user}_${response.data.sess_id}`;
             userSessions.set(final_user, {
+                clientId,
                 sess_id: response.data.sess_id,
                 sess_server: sess_server
             });
@@ -239,8 +268,14 @@ io.on('connection', (socket) => {
         console.error(`[Socket.IO] Error en socket (${socket.id}):`, error);
     });
     
-    socket.on("startQR", () => {
-        if (!botReady) startWhatsAppClient();
+    socket.on("startQR", ({ clientId }) => {
+        if (!clientId) {
+            socket.emit('authError', 'Client ID is required');
+            return;
+        }
+
+        console.log(`🔄 Iniciando QR para cliente ${clientId}`);
+        startWhatsAppClient(clientId, socket);
     });
     
     if (lastQr && !botReady) {
