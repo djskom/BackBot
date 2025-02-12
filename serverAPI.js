@@ -76,54 +76,35 @@ const startWhatsAppClient = (clientId, socket) => {
         } 
     });
 
-    let qrAttempts = 0;
-    const MAX_QR_ATTEMPTS = 5; // Número máximo de intentos de QR
-
+    // Inicializar datos del cliente
     clients.set(clientId, {
         client,
         ready: false,
-        qr: null,
-        lastQrTime: null
+        qr: null
     });
 
     client.on('qr', (qr) => {
         const clientData = clients.get(clientId);
-        if (clientData.ready) {
-            console.log('🛑 Cliente ya conectado, ignorando QR');
-            return;
-        }
-
-        qrAttempts++;
-        if (qrAttempts > MAX_QR_ATTEMPTS) {
-            console.log('🔄 Máximo de intentos de QR alcanzado, reiniciando cliente...');
-            client.destroy();
-            clients.delete(clientId);
-            socket.emit('authError', 'QR expirado, por favor intenta de nuevo');
-            return;
-        }
+        if (clientData.ready) return;
         
-        console.log(`📱 Generando QR para cliente ${clientId} (intento ${qrAttempts})...`);
+        console.log('📡 Generando nuevo QR...');
         const qr_png = qrcode.imageSync(qr, { type: 'png' });
         const qrBase64 = `data:image/png;base64,${qr_png.toString('base64')}`;
         
+        // Actualizar el QR más reciente
         clientData.qr = qrBase64;
-        clientData.lastQrTime = Date.now();
-        
-        // Emitir el nuevo QR a todos los sockets conectados para este cliente
-        io.emit(`qrCode_${clientId}`, qrBase64);
+        // Emitir el nuevo QR a todos los clientes
+        io.emit('qrCode', qrBase64);
     });
 
     client.on('ready', () => {
         const clientData = clients.get(clientId);
         if (!clientData) return;
 
+        console.log('✅ WhatsApp Bot conectado!');
         clientData.ready = true;
-        clientData.qr = null; // Limpiar QR al conectar
-        clientData.lastQrTime = null;
-        qrAttempts = 0; // Resetear contador de intentos
-
-        console.log(`✅ WhatsApp Bot conectado para cliente ${clientId}!`);
-        io.emit(`botReady_${clientId}`, true);
+        clientData.qr = null; // Limpiar QR una vez conectado
+        io.emit('botReady', true);
     });
 
     client.on('auth_failure', (msg) => {
@@ -287,16 +268,7 @@ io.use((socket, next) => {
 
 // API para manejar WebSocket con mejor logging
 io.on('connection', (socket) => {
-    console.log(`[Socket.IO] Cliente conectado (${socket.id})`);
-    console.log(`[Socket.IO] Usando transporte: ${socket.conn.transport.name}`);
-    
-    socket.on('disconnect', (reason) => {
-        console.log(`[Socket.IO] Cliente desconectado (${socket.id}): ${reason}`);
-    });
-
-    socket.on('error', (error) => {
-        console.error(`[Socket.IO] Error en socket (${socket.id}):`, error);
-    });
+    console.log('📡 Cliente conectado');
     
     socket.on("startQR", ({ clientId }) => {
         if (!clientId) {
@@ -304,22 +276,22 @@ io.on('connection', (socket) => {
             return;
         }
 
-        console.log(`🔄 Iniciando/Recuperando QR para cliente ${clientId}`);
-        
         const clientData = clients.get(clientId);
         if (clientData) {
             if (clientData.ready) {
                 socket.emit('botReady', true);
-            } else if (clientData.qr && Date.now() - clientData.lastQrTime < 60000) {
-                // Enviar QR almacenado solo si tiene menos de 1 minuto
+            } else if (clientData.qr) {
+                // Enviar el QR más reciente al nuevo cliente
                 socket.emit('qrCode', clientData.qr);
-            } else {
-                // Si el QR es viejo o no existe, iniciar nuevo cliente
-                startWhatsAppClient(clientId, socket);
             }
+            // Si no hay QR, el evento qr del cliente se activará y enviará uno nuevo
         } else {
             startWhatsAppClient(clientId, socket);
         }
+    });
+
+    socket.on('disconnect', () => {
+        console.log('📡 Cliente desconectado');
     });
 });
 
